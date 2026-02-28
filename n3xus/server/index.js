@@ -13,6 +13,8 @@ const wss = new ws.WebSocketServer({ server });
 
 const PORT = process.env.PORT || 3000;
 
+app.set('trust proxy', true);
+
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
@@ -21,21 +23,34 @@ app.use(express.static(path.join(__dirname, '../public')));
 function broadcast(data) {
   const msg = JSON.stringify(data);
   wss.clients.forEach(client => {
-    if (client.readyState === ws.WebSocket.OPEN) client.send(msg);
+    if (client.readyState === ws.WebSocket.OPEN) {
+      client.send(msg);
+    }
   });
 }
 
-// ── Real Visitor Logging Middleware ─────────────────
-app.use(async (req, res, next) => {
-  const ip =
+// ── Helper to get real IP ───────────────────────────
+function getIP(req) {
+  let ip =
     req.headers['x-forwarded-for']?.split(',')[0] ||
     req.socket.remoteAddress ||
     '';
 
+  if (ip.startsWith('::ffff:')) {
+    ip = ip.replace('::ffff:', '');
+  }
+
+  return ip;
+}
+
+// ── Visitor Logging ─────────────────────────────────
+app.use(async (req, res, next) => {
+  const ip = getIP(req);
   if (!ip) return next();
 
   try {
     const geo = await lookupIP(ip);
+    if (!geo) return next();
 
     ipLog.add({
       ip: geo.ip,
@@ -47,16 +62,18 @@ app.use(async (req, res, next) => {
       threat: 0
     });
 
-    actLog.add('info', `Request: ${req.method} ${req.path}`, ip);
+    actLog.add('info', `Request: ${req.method} ${req.path}`, geo.ip);
 
     broadcast({ type: 'visitor', data: geo });
 
-  } catch {}
+  } catch (err) {
+    console.error('Geo lookup failed:', err.message);
+  }
 
   next();
 });
 
-// ── Attack Detection Middleware ─────────────────────
+// ── Attack Detection ────────────────────────────────
 const suspiciousPatterns = [
   'union select',
   'or 1=1',
@@ -67,15 +84,14 @@ const suspiciousPatterns = [
   'etc/passwd'
 ];
 
-app.use((req, res, next) => {
-  const payload = JSON.stringify(req.query) + JSON.stringify(req.body);
+app.use(async (req, res, next) => {
+  const payload = (JSON.stringify(req.query) + JSON.stringify(req.body)).toLowerCase();
 
   for (const pattern of suspiciousPatterns) {
-    if (payload.toLowerCase().includes(pattern)) {
+    if (payload.includes(pattern)) {
 
-      const ip =
-        req.headers['x-forwarded-for']?.split(',')[0] ||
-        req.socket.remoteAddress;
+      const ip = getIP(req);
+      const geo = await lookupIP(ip);
 
       actLog.add('alert', `Attack detected: ${pattern}`, ip);
 
@@ -83,16 +99,20 @@ app.use((req, res, next) => {
         title: `Attack pattern: ${pattern}`,
         severity: 'high',
         status: 'open',
-        ip,
-        country: '',
-        city: '',
-        lat: 0,
-        lon: 0,
+        ip: geo?.ip || ip,
+        country: geo?.country || '',
+        city: geo?.city || '',
+        lat: geo?.lat || 0,
+        lon: geo?.lon || 0,
         type: 'injection',
         notes: 'Auto-detected malicious payload'
       });
 
-      broadcast({ type: 'attack', data: { ip, pattern } });
+      broadcast({
+        type: 'attack',
+        data: { ip, pattern }
+      });
+
       break;
     }
   }
@@ -101,9 +121,17 @@ app.use((req, res, next) => {
 });
 
 // ── API ──────────────────────────────────────────────
-app.get('/api/incidents', (req, res) => res.json(incidents.all()));
-app.get('/api/logs', (req, res) => res.json(actLog.recent(100)));
-app.get('/api/ips', (req, res) => res.json(ipLog.recent(50)));
+app.get('/api/incidents', (req, res) => {
+  res.json(incidents.all());
+});
+
+app.get('/api/logs', (req, res) => {
+  res.json(actLog.recent(100));
+});
+
+app.get('/api/ips', (req, res) => {
+  res.json(ipLog.recent(50));
+});
 
 app.get('/api/stats', (req, res) => {
   res.json({
@@ -113,7 +141,7 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
-// ── WebSocket ────────────────────────────────────────
+// ── WebSocket ───────────────────────────────────────
 wss.on('connection', socket => {
   socket.send(JSON.stringify({
     type: 'init',
@@ -126,7 +154,7 @@ wss.on('connection', socket => {
   }));
 });
 
-// ── Start ────────────────────────────────────────────
+// ── Start ───────────────────────────────────────────
 server.listen(PORT, () => {
   console.log(`N3XUS running on port ${PORT}`);
 });

@@ -1,10 +1,12 @@
-const fetch = require('node-fetch');
+// geo.js — Node 18+ / 20+ / 22 compatible (no node-fetch)
 
 const cache = new Map();
-const CACHE_TTL = 1000 * 60 * 60;
+const CACHE_TTL = 1000 * 60 * 60; // 1 hour
 
 async function lookupIP(ip) {
   if (!ip) return null;
+
+  ip = normalizeIP(ip);
 
   if (cache.has(ip)) {
     const entry = cache.get(ip);
@@ -12,7 +14,7 @@ async function lookupIP(ip) {
   }
 
   if (isPrivate(ip)) {
-    return {
+    const localData = {
       ip,
       country: 'Internal',
       city: 'LAN',
@@ -21,10 +23,13 @@ async function lookupIP(ip) {
       isp: 'Private',
       threat: false
     };
+
+    cache.set(ip, { ts: Date.now(), data: localData });
+    return localData;
   }
 
   try {
-    const res = await fetch(`http://ip-api.com/json/${ip}`);
+    const res = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,city,lat,lon,isp,query`);
     const data = await res.json();
 
     if (data.status !== 'success') throw new Error();
@@ -53,6 +58,12 @@ async function lookupIP(ip) {
       threat: false
     };
   }
+}
+
+function normalizeIP(ip) {
+  if (!ip) return '';
+  if (ip.startsWith('::ffff:')) return ip.replace('::ffff:', '');
+  return ip;
 }
 
 function isPrivate(ip) {
